@@ -27,7 +27,8 @@ const navItems = [
 
 export default function Sidebar() {
   const pathname = usePathname();
-  const { user, logout } = useAuthStore();
+  const { user, logout: logoutStore } = useAuthStore();
+  const logout = () => logoutStore(); // async Supabase logout
   const [collapsed, setCollapsed] = useState(false);
 
   return (

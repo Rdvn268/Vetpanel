@@ -1,9 +1,76 @@
 const router = require('express').Router();
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
 const { body, validationResult } = require('express-validator');
-const prisma = require('../lib/prisma');
+const supabase = require('../lib/supabase');
 const { authenticate } = require('../middleware/auth.middleware');
+
+// POST /api/auth/register — Klinik + ilk kullanıcı oluştur
+router.post('/register', [
+  body('clinicName').notEmpty().trim(),
+  body('email').isEmail().normalizeEmail(),
+  body('password').isLength({ min: 6 }),
+  body('firstName').notEmpty().trim(),
+  body('lastName').notEmpty().trim(),
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+  const { clinicName, email, password, firstName, lastName, phone } = req.body;
+  try {
+    // 1. Supabase Auth'da kullanıcı oluştur (admin API)
+    const { data: authData, error: authError } = await supabase.auth.admin.createUser({
+      email,
+      password,
+      email_confirm: true, // email doğrulama gerek yok (klinik için)
+    });
+    if (authError) return res.status(400).json({ error: authError.message });
+
+    // 2. Klinik oluştur
+    const { data: clinic, error: clinicError } = await supabase
+      .from('clinics')
+      .insert({ name: clinicName })
+      .select()
+      .single();
+    if (clinicError) throw clinicError;
+
+    // 3. Kullanıcı profili oluştur (users tablosu)
+    const { data: userProfile, error: profileError } = await supabase
+      .from('users')
+      .insert({
+        id: authData.user.id,
+        clinic_id: clinic.id,
+        email,
+        first_name: firstName,
+        last_name: lastName,
+        phone,
+        role: 'CLINIC_OWNER',
+      })
+      .select()
+      .single();
+    if (profileError) throw profileError;
+
+    // 4. Login yap ve token al
+    const { data: session, error: loginError } = await supabase.auth.signInWithPassword({
+      email,
+      password,
+    });
+    if (loginError) throw loginError;
+
+    res.status(201).json({
+      token: session.session.access_token,
+      user: {
+        id: userProfile.id,
+        email: userProfile.email,
+        firstName: userProfile.first_name,
+        lastName: userProfile.last_name,
+        role: userProfile.role,
+        clinic: { id: clinic.id, name: clinic.name },
+      },
+    });
+  } catch (err) {
+    console.error('Register error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // POST /api/auth/login
 router.post('/login', [
@@ -15,83 +82,29 @@ router.post('/login', [
 
   const { email, password } = req.body;
   try {
-    const user = await prisma.user.findUnique({
-      where: { email },
-      include: { clinic: { select: { id: true, name: true } } },
-    });
+    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+    if (error) return res.status(401).json({ error: 'Email veya şifre hatalı' });
 
-    if (!user || !user.isActive) {
-      return res.status(401).json({ error: 'Email veya şifre hatalı' });
+    // Kullanıcı profilini ve klinik bilgisini al
+    const { data: profile } = await supabase
+      .from('users')
+      .select('*, clinics(id, name, logo)')
+      .eq('id', data.user.id)
+      .single();
+
+    if (!profile?.is_active) {
+      return res.status(401).json({ error: 'Hesabınız devre dışı bırakılmış' });
     }
-
-    const validPassword = await bcrypt.compare(password, user.passwordHash);
-    if (!validPassword) {
-      return res.status(401).json({ error: 'Email veya şifre hatalı' });
-    }
-
-    const token = jwt.sign(
-      { userId: user.id, role: user.role, clinicId: user.clinicId },
-      process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
-    );
 
     res.json({
-      token,
+      token: data.session.access_token,
       user: {
-        id: user.id,
-        email: user.email,
-        firstName: user.firstName,
-        lastName: user.lastName,
-        role: user.role,
-        clinic: user.clinic,
-      },
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// POST /api/auth/register (ilk klinik kurulumu için)
-router.post('/register', [
-  body('clinicName').notEmpty(),
-  body('email').isEmail().normalizeEmail(),
-  body('password').isLength({ min: 6 }),
-  body('firstName').notEmpty(),
-  body('lastName').notEmpty(),
-], async (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
-
-  const { clinicName, email, password, firstName, lastName, phone } = req.body;
-  try {
-    const existingUser = await prisma.user.findUnique({ where: { email } });
-    if (existingUser) return res.status(400).json({ error: 'Bu email zaten kayıtlı' });
-
-    const passwordHash = await bcrypt.hash(password, 12);
-
-    const result = await prisma.$transaction(async (tx) => {
-      const clinic = await tx.clinic.create({ data: { name: clinicName } });
-      const user = await tx.user.create({
-        data: { clinicId: clinic.id, email, passwordHash, firstName, lastName, phone, role: 'CLINIC_OWNER' },
-      });
-      return { clinic, user };
-    });
-
-    const token = jwt.sign(
-      { userId: result.user.id, role: result.user.role, clinicId: result.clinic.id },
-      process.env.JWT_SECRET,
-      { expiresIn: '7d' }
-    );
-
-    res.status(201).json({
-      token,
-      user: {
-        id: result.user.id,
-        email: result.user.email,
-        firstName: result.user.firstName,
-        lastName: result.user.lastName,
-        role: result.user.role,
-        clinic: { id: result.clinic.id, name: result.clinic.name },
+        id: profile.id,
+        email: profile.email,
+        firstName: profile.first_name,
+        lastName: profile.last_name,
+        role: profile.role,
+        clinic: profile.clinics,
       },
     });
   } catch (err) {
@@ -101,15 +114,22 @@ router.post('/register', [
 
 // GET /api/auth/me
 router.get('/me', authenticate, async (req, res) => {
-  const user = await prisma.user.findUnique({
-    where: { id: req.user.id },
-    select: {
-      id: true, email: true, firstName: true, lastName: true,
-      role: true, phone: true, avatar: true,
-      clinic: { select: { id: true, name: true, logo: true } },
-    },
+  const { data } = await supabase
+    .from('users')
+    .select('*, clinics(id, name, logo)')
+    .eq('id', req.user.id)
+    .single();
+
+  res.json({
+    id: data.id,
+    email: data.email,
+    firstName: data.first_name,
+    lastName: data.last_name,
+    role: data.role,
+    phone: data.phone,
+    avatar: data.avatar,
+    clinic: data.clinics,
   });
-  res.json(user);
 });
 
 module.exports = router;

@@ -2,6 +2,7 @@
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useAuthStore } from '@/lib/store';
+import { supabase } from '@/lib/supabase';
 import { authApi } from '@/lib/api';
 
 export default function LoginPage() {
@@ -15,13 +16,28 @@ export default function LoginPage() {
     e.preventDefault();
     setLoading(true);
     setError('');
+
     try {
-      const res = await authApi.login(form);
-      setAuth(res.data.user, res.data.token);
+      // 1. Supabase Auth ile giriş yap
+      const { data: authData, error: authError } = await supabase.auth.signInWithPassword({
+        email: form.email,
+        password: form.password,
+      });
+
+      if (authError) {
+        setError('Email veya şifre hatalı');
+        return;
+      }
+
+      // 2. Backend'den kullanıcı profilini al
+      const token = authData.session.access_token;
+      localStorage.setItem('vetpanel_token', token);
+      const profileRes = await authApi.me();
+
+      setAuth(profileRes.data, token);
       router.push('/dashboard');
-    } catch (err: unknown) {
-      const axiosError = err as { response?: { data?: { error?: string } } };
-      setError(axiosError.response?.data?.error || 'Giriş başarısız');
+    } catch {
+      setError('Giriş sırasında hata oluştu');
     } finally {
       setLoading(false);
     }
@@ -43,7 +59,7 @@ export default function LoginPage() {
               type="email"
               value={form.email}
               onChange={e => setForm({ ...form, email: e.target.value })}
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className="w-full border border-gray-300 rounded-lg px-3 py-2.5 focus:outline-none focus:ring-2 focus:ring-blue-500"
               placeholder="doktor@klinik.com"
               required
             />
@@ -54,14 +70,14 @@ export default function LoginPage() {
               type="password"
               value={form.password}
               onChange={e => setForm({ ...form, password: e.target.value })}
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className="w-full border border-gray-300 rounded-lg px-3 py-2.5 focus:outline-none focus:ring-2 focus:ring-blue-500"
               placeholder="••••••••"
               required
             />
           </div>
 
           {error && (
-            <div className="bg-red-50 text-red-600 text-sm p-3 rounded-lg">{error}</div>
+            <div className="bg-red-50 border border-red-200 text-red-600 text-sm p-3 rounded-lg">{error}</div>
           )}
 
           <button
@@ -75,7 +91,7 @@ export default function LoginPage() {
 
         <p className="text-center text-sm text-gray-500 mt-6">
           Hesabınız yok mu?{' '}
-          <a href="/register" className="text-blue-600 hover:underline">Kayıt Ol</a>
+          <a href="/register" className="text-blue-600 hover:underline font-medium">Kliniği Kur</a>
         </p>
       </div>
     </div>

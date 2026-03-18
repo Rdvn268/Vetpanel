@@ -1,6 +1,5 @@
 const router = require('express').Router();
-const { body, validationResult } = require('express-validator');
-const prisma = require('../lib/prisma');
+const supabase = require('../lib/supabase');
 const { authenticate } = require('../middleware/auth.middleware');
 
 router.use(authenticate);
@@ -10,76 +9,96 @@ router.get('/', async (req, res) => {
   const { patientId } = req.query;
   if (!patientId) return res.status(400).json({ error: 'patientId gerekli' });
 
-  const records = await prisma.medicalRecord.findMany({
-    where: { patientId },
-    include: {
-      doctor: { select: { firstName: true, lastName: true } },
-      prescriptions: { include: { medications: true } },
-    },
-    orderBy: { date: 'desc' },
-  });
+  const { data, error } = await supabase
+    .from('medical_records')
+    .select(`
+      *,
+      users!doctor_id(first_name, last_name),
+      prescriptions(*, prescription_medications(*))
+    `)
+    .eq('patient_id', patientId)
+    .order('date', { ascending: false });
 
-  res.json(records);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
 });
 
 // GET /api/medical-records/:id
 router.get('/:id', async (req, res) => {
-  const record = await prisma.medicalRecord.findUnique({
-    where: { id: req.params.id },
-    include: {
-      patient: { select: { id: true, name: true, species: true, breed: true } },
-      doctor: { select: { firstName: true, lastName: true } },
-      prescriptions: { include: { medications: true } },
-    },
-  });
-  if (!record) return res.status(404).json({ error: 'Kayıt bulunamadı' });
-  res.json(record);
+  const { data, error } = await supabase
+    .from('medical_records')
+    .select(`
+      *,
+      patients(id, name, species, breed),
+      users!doctor_id(first_name, last_name),
+      prescriptions(*, prescription_medications(*))
+    `)
+    .eq('id', req.params.id)
+    .single();
+
+  if (error || !data) return res.status(404).json({ error: 'Kayıt bulunamadı' });
+  res.json(data);
 });
 
 // POST /api/medical-records
-router.post('/', [
-  body('patientId').notEmpty(),
-], async (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
-
+router.post('/', async (req, res) => {
   const {
-    patientId, appointmentId, chiefComplaint,
-    symptoms, physicalExam, diagnosis, treatmentPlan, notes,
+    patientId, appointmentId,
+    chiefComplaint, symptoms, physicalExam,
+    diagnosis, treatmentPlan, notes,
   } = req.body;
 
-  const record = await prisma.medicalRecord.create({
-    data: {
-      patientId,
-      doctorId: req.user.id,
-      appointmentId,
-      chiefComplaint, symptoms, physicalExam,
-      diagnosis, treatmentPlan, notes,
-    },
-    include: {
-      doctor: { select: { firstName: true, lastName: true } },
-    },
-  });
+  if (!patientId) return res.status(400).json({ error: 'patientId gerekli' });
 
-  // Update appointment status if linked
+  const { data, error } = await supabase
+    .from('medical_records')
+    .insert({
+      patient_id: patientId,
+      doctor_id: req.user.id,
+      appointment_id: appointmentId || null,
+      chief_complaint: chiefComplaint,
+      symptoms,
+      physical_exam: physicalExam,
+      diagnosis,
+      treatment_plan: treatmentPlan,
+      notes,
+    })
+    .select(`*, users!doctor_id(first_name, last_name)`)
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+
+  // Randevuyu tamamlandı olarak işaretle
   if (appointmentId) {
-    await prisma.appointment.updateMany({
-      where: { id: appointmentId, clinicId: req.user.clinicId },
-      data: { status: 'COMPLETED' },
-    });
+    await supabase
+      .from('appointments')
+      .update({ status: 'COMPLETED' })
+      .eq('id', appointmentId)
+      .eq('clinic_id', req.user.clinic_id);
   }
 
-  res.status(201).json(record);
+  res.status(201).json(data);
 });
 
 // PUT /api/medical-records/:id
 router.put('/:id', async (req, res) => {
   const { chiefComplaint, symptoms, physicalExam, diagnosis, treatmentPlan, notes } = req.body;
-  const record = await prisma.medicalRecord.update({
-    where: { id: req.params.id },
-    data: { chiefComplaint, symptoms, physicalExam, diagnosis, treatmentPlan, notes },
-  });
-  res.json(record);
+  const { data, error } = await supabase
+    .from('medical_records')
+    .update({
+      chief_complaint: chiefComplaint,
+      symptoms,
+      physical_exam: physicalExam,
+      diagnosis,
+      treatment_plan: treatmentPlan,
+      notes,
+    })
+    .eq('id', req.params.id)
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
 });
 
 module.exports = router;

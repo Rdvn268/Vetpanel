@@ -1,6 +1,6 @@
 const router = require('express').Router();
 const { body, validationResult } = require('express-validator');
-const prisma = require('../lib/prisma');
+const supabase = require('../lib/supabase');
 const { authenticate } = require('../middleware/auth.middleware');
 
 router.use(authenticate);
@@ -9,36 +9,53 @@ router.use(authenticate);
 router.get('/', async (req, res) => {
   const { date, doctorId, status, startDate, endDate } = req.query;
 
-  let dateFilter = {};
+  let query = supabase
+    .from('appointments')
+    .select(`
+      *,
+      patients(id, name, species, photo),
+      users!doctor_id(id, first_name, last_name)
+    `)
+    .eq('clinic_id', req.user.clinic_id)
+    .order('start_time', { ascending: true });
+
+  if (doctorId) query = query.eq('doctor_id', doctorId);
+  if (status) query = query.eq('status', status);
+
   if (date) {
     const d = new Date(date);
-    dateFilter = {
-      startTime: {
-        gte: new Date(d.setHours(0, 0, 0, 0)),
-        lte: new Date(d.setHours(23, 59, 59, 999)),
-      },
-    };
+    const start = new Date(d.setHours(0, 0, 0, 0)).toISOString();
+    const end = new Date(d.setHours(23, 59, 59, 999)).toISOString();
+    query = query.gte('start_time', start).lte('start_time', end);
   } else if (startDate && endDate) {
-    dateFilter = {
-      startTime: { gte: new Date(startDate), lte: new Date(endDate) },
-    };
+    query = query.gte('start_time', startDate).lte('start_time', endDate);
   }
 
-  const appointments = await prisma.appointment.findMany({
-    where: {
-      clinicId: req.user.clinicId,
-      ...(doctorId && { doctorId }),
-      ...(status && { status }),
-      ...dateFilter,
-    },
-    include: {
-      patient: { select: { id: true, name: true, species: true, photo: true } },
-      doctor: { select: { id: true, firstName: true, lastName: true } },
-    },
-    orderBy: { startTime: 'asc' },
-  });
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
 
-  res.json(appointments);
+// GET /api/appointments/today
+router.get('/today', async (req, res) => {
+  const today = new Date();
+  const start = new Date(today.setHours(0, 0, 0, 0)).toISOString();
+  const end = new Date(today.setHours(23, 59, 59, 999)).toISOString();
+
+  const { data, error } = await supabase
+    .from('appointments')
+    .select(`
+      *,
+      patients(id, name, species, photo),
+      users!doctor_id(id, first_name, last_name)
+    `)
+    .eq('clinic_id', req.user.clinic_id)
+    .gte('start_time', start)
+    .lte('start_time', end)
+    .order('start_time', { ascending: true });
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
 });
 
 // POST /api/appointments
@@ -46,75 +63,65 @@ router.post('/', [
   body('patientId').notEmpty(),
   body('doctorId').notEmpty(),
   body('title').notEmpty(),
-  body('startTime').isISO8601(),
-  body('endTime').isISO8601(),
+  body('startTime').notEmpty(),
+  body('endTime').notEmpty(),
 ], async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
   const { patientId, doctorId, title, type, startTime, endTime, notes } = req.body;
-
-  const appointment = await prisma.appointment.create({
-    data: {
-      clinicId: req.user.clinicId,
-      patientId, doctorId, title,
+  const { data, error } = await supabase
+    .from('appointments')
+    .insert({
+      clinic_id: req.user.clinic_id,
+      patient_id: patientId,
+      doctor_id: doctorId,
+      title,
       type: type || 'CHECKUP',
-      startTime: new Date(startTime),
-      endTime: new Date(endTime),
+      start_time: startTime,
+      end_time: endTime,
       notes,
-    },
-    include: {
-      patient: { select: { id: true, name: true, species: true } },
-      doctor: { select: { id: true, firstName: true, lastName: true } },
-    },
-  });
+    })
+    .select(`
+      *,
+      patients(id, name, species),
+      users!doctor_id(id, first_name, last_name)
+    `)
+    .single();
 
-  res.status(201).json(appointment);
+  if (error) return res.status(500).json({ error: error.message });
+  res.status(201).json(data);
 });
 
 // PUT /api/appointments/:id
 router.put('/:id', async (req, res) => {
   const { title, type, status, startTime, endTime, notes, doctorId } = req.body;
-  const appointment = await prisma.appointment.updateMany({
-    where: { id: req.params.id, clinicId: req.user.clinicId },
-    data: {
+  const { error } = await supabase
+    .from('appointments')
+    .update({
       title, type, status,
-      startTime: startTime ? new Date(startTime) : undefined,
-      endTime: endTime ? new Date(endTime) : undefined,
-      notes, doctorId,
-    },
-  });
-  if (!appointment.count) return res.status(404).json({ error: 'Randevu bulunamadı' });
+      start_time: startTime,
+      end_time: endTime,
+      notes,
+      doctor_id: doctorId,
+    })
+    .eq('id', req.params.id)
+    .eq('clinic_id', req.user.clinic_id);
+
+  if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
 
-// DELETE /api/appointments/:id
+// DELETE /api/appointments/:id (iptal et)
 router.delete('/:id', async (req, res) => {
-  await prisma.appointment.updateMany({
-    where: { id: req.params.id, clinicId: req.user.clinicId },
-    data: { status: 'CANCELLED' },
-  });
-  res.json({ success: true });
-});
+  const { error } = await supabase
+    .from('appointments')
+    .update({ status: 'CANCELLED' })
+    .eq('id', req.params.id)
+    .eq('clinic_id', req.user.clinic_id);
 
-// GET /api/appointments/today
-router.get('/today', async (req, res) => {
-  const today = new Date();
-  const appointments = await prisma.appointment.findMany({
-    where: {
-      clinicId: req.user.clinicId,
-      startTime: {
-        gte: new Date(today.setHours(0, 0, 0, 0)),
-        lte: new Date(today.setHours(23, 59, 59, 999)),
-      },
-    },
-    include: {
-      patient: { select: { id: true, name: true, species: true, photo: true } },
-      doctor: { select: { id: true, firstName: true, lastName: true } },
-    },
-    orderBy: { startTime: 'asc' },
-  });
-  res.json(appointments);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
 });
 
 module.exports = router;

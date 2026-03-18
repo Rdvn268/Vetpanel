@@ -1,78 +1,102 @@
 const router = require('express').Router();
-const prisma = require('../lib/prisma');
+const supabase = require('../lib/supabase');
 const { authenticate } = require('../middleware/auth.middleware');
 
 router.use(authenticate);
 
-// GET /api/hospitalizations - Aktif yatışlar
+// GET /api/hospitalizations
 router.get('/', async (req, res) => {
   const { status = 'ACTIVE' } = req.query;
-  const hospitalizations = await prisma.hospitalization.findMany({
-    where: {
-      patient: { clinicId: req.user.clinicId },
-      status,
-    },
-    include: {
-      patient: {
-        select: {
-          id: true, name: true, species: true, photo: true,
-          client: { select: { firstName: true, lastName: true, phone: true } },
-        },
-      },
-      dailyRecords: { orderBy: { date: 'desc' }, take: 1 },
-    },
-    orderBy: { admittedAt: 'desc' },
-  });
-  res.json(hospitalizations);
+
+  const { data, error } = await supabase
+    .from('hospitalizations')
+    .select(`
+      *,
+      patients(
+        id, name, species, photo,
+        clients(first_name, last_name, phone)
+      ),
+      hospitalization_records(* ORDER BY date DESC LIMIT 1)
+    `)
+    .eq('status', status)
+    .eq('patients.clinic_id', req.user.clinic_id)
+    .order('admitted_at', { ascending: false });
+
+  if (error) return res.status(500).json({ error: error.message });
+
+  // clinic_id filtresi
+  const filtered = (data || []).filter(h => h.patients?.clients !== null);
+  res.json(filtered);
 });
 
 // GET /api/hospitalizations/:id
 router.get('/:id', async (req, res) => {
-  const hosp = await prisma.hospitalization.findUnique({
-    where: { id: req.params.id },
-    include: {
-      patient: {
-        select: {
-          id: true, name: true, species: true, breed: true,
-          client: { select: { firstName: true, lastName: true, phone: true } },
-        },
-      },
-      dailyRecords: { orderBy: { date: 'desc' } },
-    },
-  });
-  if (!hosp) return res.status(404).json({ error: 'Yatış kaydı bulunamadı' });
-  res.json(hosp);
+  const { data, error } = await supabase
+    .from('hospitalizations')
+    .select(`
+      *,
+      patients(
+        id, name, species, breed,
+        clients(first_name, last_name, phone)
+      ),
+      hospitalization_records(* ORDER BY date DESC)
+    `)
+    .eq('id', req.params.id)
+    .single();
+
+  if (error || !data) return res.status(404).json({ error: 'Yatış kaydı bulunamadı' });
+  res.json(data);
 });
 
 // POST /api/hospitalizations
 router.post('/', async (req, res) => {
   const { patientId, cageNumber, reason, notes } = req.body;
-  const hosp = await prisma.hospitalization.create({
-    data: { patientId, cageNumber, reason, notes },
-  });
-  res.status(201).json(hosp);
+  const { data, error } = await supabase
+    .from('hospitalizations')
+    .insert({
+      patient_id: patientId,
+      cage_number: cageNumber,
+      reason, notes,
+    })
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.status(201).json(data);
 });
 
-// POST /api/hospitalizations/:id/records - Günlük kayıt ekle
+// POST /api/hospitalizations/:id/records
 router.post('/:id/records', async (req, res) => {
   const { temperature, weight, treatments, fluidTherapy, feeding, notes } = req.body;
-  const record = await prisma.hospitalizationRecord.create({
-    data: {
-      hospitalizationId: req.params.id,
-      temperature, weight, treatments, fluidTherapy, feeding, notes,
-      createdBy: `${req.user.firstName} ${req.user.lastName}`,
-    },
-  });
-  res.status(201).json(record);
+  const { data, error } = await supabase
+    .from('hospitalization_records')
+    .insert({
+      hospitalization_id: req.params.id,
+      temperature: temperature || null,
+      weight: weight || null,
+      treatments,
+      fluid_therapy: fluidTherapy,
+      feeding, notes,
+      created_by: `${req.user.first_name} ${req.user.last_name}`,
+    })
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.status(201).json(data);
 });
 
-// PATCH /api/hospitalizations/:id/discharge - Taburcu et
+// PATCH /api/hospitalizations/:id/discharge
 router.patch('/:id/discharge', async (req, res) => {
-  const hosp = await prisma.hospitalization.update({
-    where: { id: req.params.id },
-    data: { status: 'DISCHARGED', dischargedAt: new Date() },
-  });
-  res.json(hosp);
+  const { data, error } = await supabase
+    .from('hospitalizations')
+    .update({ status: 'DISCHARGED', discharged_at: new Date().toISOString() })
+    .eq('id', req.params.id)
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
 });
 
 module.exports = router;

@@ -1,50 +1,57 @@
 const router = require('express').Router();
-const prisma = require('../lib/prisma');
-const { authenticate, authorize } = require('../middleware/auth.middleware');
+const supabase = require('../lib/supabase');
+const { authenticate } = require('../middleware/auth.middleware');
 
 router.use(authenticate);
 
 const generateInvoiceNumber = () => {
-  const date = new Date();
-  const ymd = `${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, '0')}${String(date.getDate()).padStart(2, '0')}`;
-  const rand = Math.floor(Math.random() * 9000) + 1000;
-  return `INV-${ymd}-${rand}`;
+  const d = new Date();
+  const ymd = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`;
+  return `INV-${ymd}-${Math.floor(Math.random() * 9000) + 1000}`;
 };
 
 // GET /api/invoices
 router.get('/', async (req, res) => {
   const { clientId, status, startDate, endDate } = req.query;
-  const invoices = await prisma.invoice.findMany({
-    where: {
-      clinicId: req.user.clinicId,
-      ...(clientId && { clientId }),
-      ...(status && { status }),
-      ...(startDate && endDate && {
-        date: { gte: new Date(startDate), lte: new Date(endDate) },
-      }),
-    },
-    include: {
-      client: { select: { firstName: true, lastName: true, phone: true } },
-      items: true,
-      payments: true,
-    },
-    orderBy: { date: 'desc' },
-  });
-  res.json(invoices);
+
+  let query = supabase
+    .from('invoices')
+    .select(`
+      *,
+      clients(first_name, last_name, phone),
+      invoice_items(*),
+      payments(*)
+    `)
+    .eq('clinic_id', req.user.clinic_id)
+    .order('date', { ascending: false });
+
+  if (clientId) query = query.eq('client_id', clientId);
+  if (status) query = query.eq('status', status);
+  if (startDate && endDate) {
+    query = query.gte('date', startDate).lte('date', endDate);
+  }
+
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
 });
 
 // GET /api/invoices/:id
 router.get('/:id', async (req, res) => {
-  const invoice = await prisma.invoice.findFirst({
-    where: { id: req.params.id, clinicId: req.user.clinicId },
-    include: {
-      client: true,
-      items: { include: { inventoryItem: { select: { name: true } } } },
-      payments: true,
-    },
-  });
-  if (!invoice) return res.status(404).json({ error: 'Fatura bulunamadı' });
-  res.json(invoice);
+  const { data, error } = await supabase
+    .from('invoices')
+    .select(`
+      *,
+      clients(*),
+      invoice_items(*, inventory_items(name)),
+      payments(*)
+    `)
+    .eq('id', req.params.id)
+    .eq('clinic_id', req.user.clinic_id)
+    .single();
+
+  if (error || !data) return res.status(404).json({ error: 'Fatura bulunamadı' });
+  res.json(data);
 });
 
 // POST /api/invoices
@@ -55,55 +62,80 @@ router.post('/', async (req, res) => {
   const taxAmount = subtotal * (taxRate / 100);
   const totalAmount = subtotal + taxAmount - discountAmount;
 
-  const invoice = await prisma.invoice.create({
-    data: {
-      clinicId: req.user.clinicId,
-      clientId,
-      invoiceNumber: generateInvoiceNumber(),
-      dueDate: dueDate ? new Date(dueDate) : null,
+  // Fatura oluştur
+  const { data: invoice, error: invError } = await supabase
+    .from('invoices')
+    .insert({
+      clinic_id: req.user.clinic_id,
+      client_id: clientId,
+      invoice_number: generateInvoiceNumber(),
+      due_date: dueDate || null,
       subtotal,
-      taxAmount,
-      discountAmount,
-      totalAmount,
+      tax_amount: taxAmount,
+      discount_amount: discountAmount,
+      total_amount: totalAmount,
       notes,
-      items: {
-        create: items.map(item => ({
-          inventoryItemId: item.inventoryItemId || null,
-          description: item.description,
-          quantity: item.quantity,
-          unitPrice: item.unitPrice,
-          totalPrice: item.quantity * item.unitPrice,
-        })),
-      },
-    },
-    include: { items: true, client: { select: { firstName: true, lastName: true } } },
-  });
+    })
+    .select()
+    .single();
 
-  res.status(201).json(invoice);
+  if (invError) return res.status(500).json({ error: invError.message });
+
+  // Fatura kalemlerini ekle
+  const invoiceItems = items.map(item => ({
+    invoice_id: invoice.id,
+    inventory_item_id: item.inventoryItemId || null,
+    description: item.description,
+    quantity: item.quantity,
+    unit_price: item.unitPrice,
+    total_price: item.quantity * item.unitPrice,
+  }));
+
+  await supabase.from('invoice_items').insert(invoiceItems);
+
+  const { data: full } = await supabase
+    .from('invoices')
+    .select('*, clients(first_name, last_name), invoice_items(*)')
+    .eq('id', invoice.id)
+    .single();
+
+  res.status(201).json(full);
 });
 
-// POST /api/invoices/:id/payments - Ödeme ekle
+// POST /api/invoices/:id/payments
 router.post('/:id/payments', async (req, res) => {
   const { amount, method, reference, notes } = req.body;
 
-  const invoice = await prisma.invoice.findFirst({
-    where: { id: req.params.id, clinicId: req.user.clinicId },
-    include: { payments: true },
-  });
+  const { data: invoice } = await supabase
+    .from('invoices')
+    .select('paid_amount, total_amount')
+    .eq('id', req.params.id)
+    .eq('clinic_id', req.user.clinic_id)
+    .single();
+
   if (!invoice) return res.status(404).json({ error: 'Fatura bulunamadı' });
 
-  const payment = await prisma.payment.create({
-    data: { invoiceId: req.params.id, amount, method: method || 'CASH', reference, notes },
-  });
+  const { data: payment, error } = await supabase
+    .from('payments')
+    .insert({
+      invoice_id: req.params.id,
+      amount,
+      method: method || 'CASH',
+      reference, notes,
+    })
+    .select()
+    .single();
 
-  const newPaidAmount = Number(invoice.paidAmount) + Number(amount);
-  const status = newPaidAmount >= Number(invoice.totalAmount) ? 'PAID'
-    : newPaidAmount > 0 ? 'PARTIAL' : 'PENDING';
+  if (error) return res.status(500).json({ error: error.message });
 
-  await prisma.invoice.update({
-    where: { id: req.params.id },
-    data: { paidAmount: newPaidAmount, status },
-  });
+  const newPaid = Number(invoice.paid_amount) + Number(amount);
+  const status = newPaid >= Number(invoice.total_amount) ? 'PAID'
+    : newPaid > 0 ? 'PARTIAL' : 'PENDING';
+
+  await supabase
+    .from('invoices')
+    .update({ paid_amount: newPaid, status })
+    .eq('id', req.params.id);
 
   res.status(201).json(payment);
 });

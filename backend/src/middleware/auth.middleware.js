@@ -1,5 +1,4 @@
-const jwt = require('jsonwebtoken');
-const prisma = require('../lib/prisma');
+const supabase = require('../lib/supabase');
 
 const authenticate = async (req, res, next) => {
   const authHeader = req.headers.authorization;
@@ -9,20 +8,27 @@ const authenticate = async (req, res, next) => {
 
   const token = authHeader.split(' ')[1];
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await prisma.user.findUnique({
-      where: { id: decoded.userId },
-      select: { id: true, email: true, role: true, clinicId: true, isActive: true, firstName: true, lastName: true },
-    });
-
-    if (!user || !user.isActive) {
-      return res.status(401).json({ error: 'Geçersiz veya devre dışı hesap' });
+    // Supabase token'ı doğrula
+    const { data: { user: authUser }, error } = await supabase.auth.getUser(token);
+    if (error || !authUser) {
+      return res.status(401).json({ error: 'Geçersiz token' });
     }
 
-    req.user = user;
+    // Kullanıcı profilini al (clinic_id, role)
+    const { data: profile, error: profileError } = await supabase
+      .from('users')
+      .select('id, email, first_name, last_name, role, clinic_id, is_active')
+      .eq('id', authUser.id)
+      .single();
+
+    if (profileError || !profile || !profile.is_active) {
+      return res.status(401).json({ error: 'Kullanıcı bulunamadı veya devre dışı' });
+    }
+
+    req.user = profile;
     next();
-  } catch {
-    return res.status(401).json({ error: 'Geçersiz token' });
+  } catch (err) {
+    return res.status(401).json({ error: 'Kimlik doğrulama hatası' });
   }
 };
 

@@ -1,6 +1,6 @@
 # 🐾 VetPanel — Veteriner Klinik Yönetim Sistemi
 
-Modern, tam özellikli veteriner klinik yönetim sistemi. Next.js 15 + Node.js/Express + PostgreSQL/Prisma ile inşa edilmiştir.
+Modern, tam özellikli veteriner klinik yönetim sistemi. Next.js 15 + Node.js/Express + **Supabase** ile inşa edilmiştir.
 
 ## Özellikler
 
@@ -22,15 +22,15 @@ Modern, tam özellikli veteriner klinik yönetim sistemi. Next.js 15 + Node.js/E
 |--------|-----------|
 | Frontend | Next.js 15 (App Router), TypeScript, Tailwind CSS |
 | Backend | Node.js, Express 5 |
-| Veritabanı | PostgreSQL |
-| ORM | Prisma |
-| Auth | JWT |
+| Veritabanı | **Supabase** (PostgreSQL) |
+| Auth | **Supabase Auth** |
+| DB Client | **@supabase/supabase-js** |
 | State | Zustand |
 | Grafikler | Recharts |
 
 ## Kurulum
 
-### 1. Veritabanı
+### 1. Supabase Projesi
 
 ```bash
 # PostgreSQL kurulu olmalı

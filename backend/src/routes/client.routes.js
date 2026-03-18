@@ -1,6 +1,6 @@
 const router = require('express').Router();
-const { body, query, validationResult } = require('express-validator');
-const prisma = require('../lib/prisma');
+const { body, validationResult } = require('express-validator');
+const supabase = require('../lib/supabase');
 const { authenticate, authorize } = require('../middleware/auth.middleware');
 
 router.use(authenticate);
@@ -8,49 +8,47 @@ router.use(authenticate);
 // GET /api/clients
 router.get('/', async (req, res) => {
   const { search, page = 1, limit = 20 } = req.query;
-  const skip = (Number(page) - 1) * Number(limit);
+  const from = (Number(page) - 1) * Number(limit);
+  const to = from + Number(limit) - 1;
 
-  const where = {
-    clinicId: req.user.clinicId,
-    ...(search && {
-      OR: [
-        { firstName: { contains: search, mode: 'insensitive' } },
-        { lastName: { contains: search, mode: 'insensitive' } },
-        { phone: { contains: search } },
-        { email: { contains: search, mode: 'insensitive' } },
-      ],
-    }),
-  };
+  let query = supabase
+    .from('clients')
+    .select('*, patients(id, name, species)', { count: 'exact' })
+    .eq('clinic_id', req.user.clinic_id)
+    .order('created_at', { ascending: false })
+    .range(from, to);
 
-  const [clients, total] = await Promise.all([
-    prisma.client.findMany({
-      where, skip, take: Number(limit),
-      include: { patients: { select: { id: true, name: true, species: true } } },
-      orderBy: { createdAt: 'desc' },
-    }),
-    prisma.client.count({ where }),
-  ]);
+  if (search) {
+    query = query.or(
+      `first_name.ilike.%${search}%,last_name.ilike.%${search}%,phone.ilike.%${search}%,email.ilike.%${search}%`
+    );
+  }
 
-  res.json({ data: clients, total, page: Number(page), limit: Number(limit) });
+  const { data, error, count } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+
+  res.json({ data, total: count, page: Number(page), limit: Number(limit) });
 });
 
 // GET /api/clients/:id
 router.get('/:id', async (req, res) => {
-  const client = await prisma.client.findFirst({
-    where: { id: req.params.id, clinicId: req.user.clinicId },
-    include: {
-      patients: {
-        include: {
-          appointments: { take: 3, orderBy: { startTime: 'desc' } },
-          vaccinations: { take: 3, orderBy: { dateAdministered: 'desc' } },
-        },
-      },
-      invoices: { take: 5, orderBy: { createdAt: 'desc' } },
-    },
-  });
+  const { data, error } = await supabase
+    .from('clients')
+    .select(`
+      *,
+      patients(
+        *,
+        appointments(id, title, start_time, status, type),
+        vaccinations(id, vaccine_name, date_administered, next_due_date)
+      ),
+      invoices(id, invoice_number, total_amount, paid_amount, status, date)
+    `)
+    .eq('id', req.params.id)
+    .eq('clinic_id', req.user.clinic_id)
+    .single();
 
-  if (!client) return res.status(404).json({ error: 'Müşteri bulunamadı' });
-  res.json(client);
+  if (error || !data) return res.status(404).json({ error: 'Müşteri bulunamadı' });
+  res.json(data);
 });
 
 // POST /api/clients
@@ -63,28 +61,51 @@ router.post('/', [
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
   const { firstName, lastName, phone, email, address, nationalId, notes } = req.body;
-  const client = await prisma.client.create({
-    data: { clinicId: req.user.clinicId, firstName, lastName, phone, email, address, nationalId, notes },
-  });
-  res.status(201).json(client);
+  const { data, error } = await supabase
+    .from('clients')
+    .insert({
+      clinic_id: req.user.clinic_id,
+      first_name: firstName,
+      last_name: lastName,
+      phone, email, address,
+      national_id: nationalId,
+      notes,
+    })
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.status(201).json(data);
 });
 
 // PUT /api/clients/:id
 router.put('/:id', async (req, res) => {
   const { firstName, lastName, phone, email, address, nationalId, notes } = req.body;
-  const client = await prisma.client.updateMany({
-    where: { id: req.params.id, clinicId: req.user.clinicId },
-    data: { firstName, lastName, phone, email, address, nationalId, notes },
-  });
-  if (!client.count) return res.status(404).json({ error: 'Müşteri bulunamadı' });
+  const { error } = await supabase
+    .from('clients')
+    .update({
+      first_name: firstName,
+      last_name: lastName,
+      phone, email, address,
+      national_id: nationalId,
+      notes,
+    })
+    .eq('id', req.params.id)
+    .eq('clinic_id', req.user.clinic_id);
+
+  if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
 
 // DELETE /api/clients/:id
 router.delete('/:id', authorize('CLINIC_OWNER', 'ADMIN'), async (req, res) => {
-  await prisma.client.deleteMany({
-    where: { id: req.params.id, clinicId: req.user.clinicId },
-  });
+  const { error } = await supabase
+    .from('clients')
+    .delete()
+    .eq('id', req.params.id)
+    .eq('clinic_id', req.user.clinic_id);
+
+  if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
 
